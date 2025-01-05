@@ -141,11 +141,16 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   embedded_schema do
     field :endpoint, :string, default: "https://api.openai.com/v1/chat/completions"
     # field :model, :string, default: "gpt-4"
-    field :model, :string, default: "gpt-3.5-turbo"
+    field :model, :string, default: "gpt-4o-mini"
     # API key for OpenAI. If not set, will use global api key. Allows for usage
     # of a different API key per-call if desired. For instance, allowing a
     # customer to provide their own.
     field :api_key, :string
+
+    # Whether to return log probabilities of the output tokens or not
+    field :logprobs, :boolean, default: false
+    # Number of most likely tokens to return at each position (requires logprobs=true)
+    field :top_logprobs, :integer
 
     # What sampling temperature to use, between 0 and 2. Higher values like 0.8
     # will make the output more random, while lower values like 0.2 will make it
@@ -205,7 +210,9 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     :stream_options,
     :user,
     :callbacks,
-    :tool_choice
+    :tool_choice,
+    :logprobs,
+    :top_logprobs
   ]
   @required_fields [:endpoint, :model]
 
@@ -296,6 +303,8 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     )
     |> Utils.conditionally_add_to_map(:tools, get_tools_for_api(tools))
     |> Utils.conditionally_add_to_map(:tool_choice, get_tool_choice(openai))
+    |> Utils.conditionally_add_to_map(:logprobs, openai.logprobs)
+    |> Utils.conditionally_add_to_map(:top_logprobs, openai.top_logprobs)
   end
 
   defp get_tools_for_api(nil), do: []
@@ -572,6 +581,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
         retry_delay: fn attempt -> 300 * attempt end
       )
 
+
     req
     |> maybe_add_org_id_header()
     |> maybe_add_proj_id_header()
@@ -579,6 +589,7 @@ defmodule LangChain.ChatModels.ChatOpenAI do
     # parse the body and return it as parsed structs
     |> case do
       {:ok, %Req.Response{body: data} = response} ->
+
         Callbacks.fire(openai.callbacks, :on_llm_ratelimit_info, [
           openai,
           get_ratelimit_info(response.headers)
@@ -759,6 +770,13 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   def do_process_response(model, %{"choices" => choices} = _data) when is_list(choices) do
     # process each response individually. Return a list of all processed choices
     for choice <- choices do
+      # Process logprobs if present
+      case get_logprobs(choice) do
+        %LangChain.LogProbs{} = logprobs ->
+          Callbacks.fire(model.callbacks, :on_llm_logprobs, [model, logprobs])
+        nil -> :ok
+      end
+
       do_process_response(model, choice)
     end
   end
@@ -986,6 +1004,14 @@ defmodule LangChain.ChatModels.ChatOpenAI do
   end
 
   defp get_token_usage(_response_body), do: nil
+
+  defp get_logprobs(%{"logprobs" => logprobs}) when not is_nil(logprobs) do
+    case LangChain.LogProbs.new(logprobs) do
+      {:ok, logprobs} -> logprobs
+      {:error, _} -> nil
+    end
+  end
+  defp get_logprobs(_), do: nil
 
   @doc """
   Generate a config map that can later restore the model's configuration.
